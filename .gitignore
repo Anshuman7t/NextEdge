@@ -1,0 +1,11 @@
+.env
+venv
+__pycache__
+*.pyc
+ruby_api.db
+rugby_data
+rugbypass_player_bios
+
+
+test.ipynb
+test.py
