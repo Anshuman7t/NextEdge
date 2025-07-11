@@ -13,6 +13,7 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from webdriver_manager.chrome import ChromeDriverManager
 from apscheduler.schedulers.background import BackgroundScheduler
+from rugbypass import scrape_all_pages
 import psycopg2
 import logging
 from typing import Optional, List, Dict, Any
@@ -83,6 +84,7 @@ class PlayerListResponse(BaseModel):
     has_prev: bool
 
 class FilterOptions(BaseModel):
+    sports: List[str]
     countries: List[str]
     teams: List[str]
     positions: List[str]
@@ -349,6 +351,10 @@ def scrape_all_background():
     
     try:
         init_db()
+        print("➡️ Running RugbyPass scraper...")
+        scrape_all_pages()
+        print("✅ RugbyPass scraper completed successfully.")
+        
         driver = setup_driver()
         
         team_urls = get_all_team_urls(driver)
@@ -375,7 +381,8 @@ def scrape_all_background():
                 time.sleep(1)  # Rate limiting
                 
             time.sleep(2)  # Rate limiting between teams
-            
+        scraping_status['current_team'] = 'Completed'
+        
         driver.quit()
         
     except Exception as e:
@@ -570,37 +577,39 @@ async def get_player(player_id: int):
 
 @app.get("/filter-options", response_model=FilterOptions, summary="Get Filter Options")
 async def get_filter_options():
-    """Get available filter options for countries, teams, positions, and sources"""
+    """Get available filter options for countries, teams, positions, sports, and sources"""
     try:
         conn = get_db_connection()
         cur = conn.cursor()
-        
-        # Get unique countries
-        cur.execute("SELECT DISTINCT country FROM players WHERE country IS NOT NULL ORDER BY country")
+
+        # ✅ This will now fetch sports too
+        cur.execute("SELECT DISTINCT sport FROM players WHERE sport IS NOT NULL AND sport != '' ORDER BY sport")
+        sports = [row[0] for row in cur.fetchall()]
+
+        cur.execute("SELECT DISTINCT country FROM players WHERE country IS NOT NULL AND country != '' ORDER BY country")
         countries = [row[0] for row in cur.fetchall()]
-        
-        # Get unique teams
-        cur.execute("SELECT DISTINCT team FROM players WHERE team IS NOT NULL ORDER BY team")
+
+        cur.execute("SELECT DISTINCT team FROM players WHERE team IS NOT NULL AND team != '' ORDER BY team")
         teams = [row[0] for row in cur.fetchall()]
-        
-        # Get unique positions
-        cur.execute("SELECT DISTINCT position FROM players WHERE position IS NOT NULL ORDER BY position")
+
+        cur.execute("SELECT DISTINCT position FROM players WHERE position IS NOT NULL AND position != '' ORDER BY position")
         positions = [row[0] for row in cur.fetchall()]
-        
-        # Get unique sources
-        cur.execute("SELECT DISTINCT source FROM players WHERE source IS NOT NULL ORDER BY source")
+
+        cur.execute("SELECT DISTINCT source FROM players WHERE source IS NOT NULL AND source != '' ORDER BY source")
         sources = [row[0] for row in cur.fetchall()]
-        
+
         return FilterOptions(
+            sports=sports,
             countries=countries,
             teams=teams,
             positions=positions,
             sources=sources
         )
-        
+
     except psycopg2.Error as e:
         logger.error(f"Database error in get_filter_options: {e}")
         raise HTTPException(status_code=500, detail="Database error")
+
     finally:
         if 'cur' in locals():
             cur.close()

@@ -2,14 +2,13 @@ import os
 import time
 import re
 import logging
-from datetime import datetime
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import TimeoutException, NoSuchElementException
+from selenium.common.exceptions import TimeoutException
 from webdriver_manager.chrome import ChromeDriverManager
 import psycopg2
 from dotenv import load_dotenv
@@ -28,7 +27,6 @@ db_params = {
 
 def setup_driver():
     options = Options()
-    # options.add_argument('--headless')  # Uncomment for headless mode
     options.add_argument('--no-sandbox')
     options.add_argument('--disable-dev-shm-usage')
     options.add_argument('--disable-gpu')
@@ -36,70 +34,50 @@ def setup_driver():
     options.add_argument('--disable-blink-features=AutomationControlled')
     options.add_experimental_option("excludeSwitches", ["enable-automation"])
     options.add_experimental_option('useAutomationExtension', False)
+    options.add_argument('--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
     
     driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
     driver.set_page_load_timeout(60)
     driver.implicitly_wait(10)
-    
-    # Execute script to avoid detection
     driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
-    
     return driver
 
 def accept_popups(driver):
-    """Handle privacy/cookie consent popup"""
-    print("Checking for privacy popup...")
-    
     popup_selectors = [
-        "button[id*='accept']",
-        "button[class*='accept']",
-        "button[id*='consent']",
-        "button[class*='consent']",
-        "button[id*='agree']",
-        "button[class*='agree']",
-        "button[id*='cookie']",
-        "button[class*='cookie']",
-        "//button[contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'accept')]",
-        "//button[contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'agree')]",
+        "button[id*='accept']", "button[class*='accept']", "button[id*='consent']",
+        "button[class*='consent']", "button[id*='agree']", "button[class*='agree']",
+        "//button[contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'accept')]"
     ]
     
     for selector in popup_selectors:
         try:
             if selector.startswith("//"):
-                elements = WebDriverWait(driver, 3).until(
-                    EC.presence_of_all_elements_located((By.XPATH, selector))
-                )
+                elements = WebDriverWait(driver, 3).until(EC.presence_of_all_elements_located((By.XPATH, selector)))
             else:
-                elements = WebDriverWait(driver, 3).until(
-                    EC.presence_of_all_elements_located((By.CSS_SELECTOR, selector))
-                )
+                elements = WebDriverWait(driver, 3).until(EC.presence_of_all_elements_located((By.CSS_SELECTOR, selector)))
             
             for element in elements:
                 if element.is_displayed() and element.is_enabled():
-                    print(f"Found privacy popup button: {element.text.strip()}")
                     driver.execute_script("arguments[0].click();", element)
-                    print("✓ Privacy popup accepted!")
                     time.sleep(3)
                     return True
-                    
         except TimeoutException:
             continue
-    
-    print("No privacy popup found")
     return False
 
 def init_db():
     conn = psycopg2.connect(**db_params)
     cur = conn.cursor()
     cur.execute("""
-        CREATE TABLE IF NOT EXISTS rugbypass_players (
+        CREATE TABLE IF NOT EXISTS players (
             id SERIAL PRIMARY KEY,
             name TEXT NOT NULL,
             age INTEGER,
             weight TEXT,
             height TEXT,
-            position TEXT,
+            sport TEXT DEFAULT 'Rugby',
             country TEXT,
+            position TEXT,
             team TEXT,
             source TEXT DEFAULT 'rugbypass.com',
             player_url TEXT UNIQUE,
@@ -111,22 +89,53 @@ def init_db():
     cur.close()
     conn.close()
 
+def cm_to_feet_inches(cm_str):
+    """Convert centimeters to feet'inches" format"""
+    if not cm_str:
+        return None
+    try:
+        cm_match = re.search(r'(\d+)', cm_str)
+        if cm_match:
+            cm = int(cm_match.group(1))
+            inches = cm / 2.54
+            feet = int(inches // 12)
+            remaining_inches = int(inches % 12)
+            return f"{feet}'{remaining_inches}\""
+    except:
+        pass
+    return None
+
+def extract_weight_kg(weight_str):
+    """Extract weight number without 'kg'"""
+    if not weight_str:
+        return None
+    try:
+        weight_match = re.search(r'(\d+)', weight_str)
+        if weight_match:
+            return weight_match.group(1)
+    except:
+        pass
+    return None
+
 def insert_player(player):
     try:
         conn = psycopg2.connect(**db_params)
         cur = conn.cursor()
-        details = player.get('detailed_bio', {}).get('extracted_details', {})
+        details = player.get('detailed_bio', {})
         
-        # Extract age as integer
         age = None
         if details.get('age'):
             try:
-                age = int(details['age'])
+                age = int(re.search(r'\d+', str(details['age'])).group())
             except:
                 pass
         
+        # Convert weight and height
+        weight = extract_weight_kg(details.get('weight'))
+        height = cm_to_feet_inches(details.get('height'))
+        
         cur.execute("""
-            INSERT INTO rugbypass_players (name, age, weight, height, position, country, team, source, player_url)
+            INSERT INTO players (name, age, weight, height, position, country, team, source, player_url)
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (player_url) DO UPDATE SET
                 age = EXCLUDED.age,
@@ -139,16 +148,16 @@ def insert_player(player):
         """, (
             player['name'],
             age,
-            details.get('weight'),
-            details.get('height'),
-            player.get('position'),
-            details.get('country') or details.get('nationality') or 'Unknown',
-            player.get('team'),
+            weight,
+            height,
+            details.get('position') or player.get('position'),
+            details.get('country') or 'Unknown',
+            details.get('team'),
             'rugbypass.com',
             player.get('player_link')
         ))
         conn.commit()
-        print(f"✓ Saved: {player['name']}")
+        print(f"✓ Saved: {player['name']} (Age: {age}, Country: {details.get('country')}, Weight: {weight}, Height: {height})")
     except Exception as e:
         print(f"❌ DB Error for {player['name']}: {e}")
     finally:
@@ -158,190 +167,84 @@ def insert_player(player):
             conn.close()
 
 def construct_player_url(player_name):
-    """Construct player URL from player name"""
     try:
-        # Convert name to URL format
         url_name = re.sub(r'[^\w\s-]', '', player_name.lower())
         url_name = re.sub(r'\s+', '-', url_name.strip())
         url_name = re.sub(r'-+', '-', url_name)
-        
         return f"https://www.rugbypass.com/players/{url_name}/"
     except Exception as e:
         print(f"Error constructing URL for {player_name}: {e}")
         return None
 
 def scrape_players_from_page(driver):
-    """Extract player data from current page"""
     try:
-        # Wait for the player list container to be visible
-        WebDriverWait(driver, 20).until(
-            EC.presence_of_element_located((By.ID, "list-players"))
-        )
-        
-        # Get the main container
+        WebDriverWait(driver, 20).until(EC.presence_of_element_located((By.ID, "list-players")))
         player_container = driver.find_element(By.ID, "list-players")
-        print("Found main player container")
         
-        players_found = []
+        # Try direct player links first
+        player_links = player_container.find_elements(By.CSS_SELECTOR, "a[href*='/players/']")
         
-        # Look for player profile links directly
-        player_link_selectors = [
-            "a[href*='/players/']",
-            "a[href*='player']",
-            ".player-name a",
-            ".name a",
-            "h4 a",
-            "h3 a"
-        ]
+        if player_links:
+            players_found = []
+            for link in player_links:
+                try:
+                    href = link.get_attribute('href')
+                    name = re.sub(r"^[\"']+|[\"']+$", "", link.get_attribute("innerText").strip().split('\n')[0])
+                    if href and name and '/players/' in href:
+                        player_data = {
+                            'name': name,
+                            'player_link': href,
+                            'team': '',
+                            'position': ''
+                        }
+                        players_found.append(player_data)
+                except:
+                    continue
+            if players_found:
+                return players_found
         
-        for selector in player_link_selectors:
-            try:
-                player_links = player_container.find_elements(By.CSS_SELECTOR, selector)
-                print(f"Found {len(player_links)} player links with selector: {selector}")
-                
-                if player_links:
-                    for link in player_links:
-                        try:
-                            href = link.get_attribute('href')
-                            name = link.text.strip()
-                            
-                            if href and name and '/players/' in href:
-                                # Extract additional info from the surrounding element
-                                player_data = extract_player_info_from_link(link)
-                                if player_data:
-                                    players_found.append(player_data)
-                                    print(f"Found player link: {name} -> {href}")
-                        except Exception as e:
-                            continue
-                    
-                    if players_found:
-                        print(f"Successfully found {len(players_found)} players with direct links")
-                        break
-                        
-            except Exception as e:
-                print(f"Error with selector {selector}: {e}")
-                continue
-        
-        # If no direct links found, try text parsing approach
-        if not players_found:
-            print("No direct player links found, trying text parsing approach...")
-            players_found = parse_player_text_with_links(player_container)
-        
-        return players_found
+        # Fallback: parse text content
+        return parse_player_text_with_links(player_container)
         
     except Exception as e:
         print(f"Error in scrape_players_from_page: {e}")
         return []
 
-def extract_player_info_from_link(link_element):
-    """Extract player information from a player link element"""
-    try:
-        href = link_element.get_attribute('href')
-        name = link_element.text.strip()
-        
-        if not href or not name or '/players/' not in href:
-            return None
-        
-        player_data = {
-            'name': name,
-            'player_link': href,
-            'team': '',
-            'position': '',
-            'raw_text': ''
-        }
-        
-        # Try to get additional info from parent elements
-        try:
-            parent = link_element.find_element(By.XPATH, "..")
-            for i in range(3):  # Check up to 3 levels up
-                try:
-                    parent_text = parent.text.strip()
-                    if parent_text and len(parent_text) > len(name):
-                        lines = [line.strip() for line in parent_text.split('\n') if line.strip()]
-                        
-                        # Usually format is: Name, Team, Position
-                        for i, line in enumerate(lines):
-                            if name.lower() in line.lower():
-                                if i + 1 < len(lines):
-                                    player_data['team'] = lines[i + 1]
-                                if i + 2 < len(lines):
-                                    player_data['position'] = lines[i + 2]
-                                break
-                        
-                        player_data['raw_text'] = parent_text
-                        break
-                    
-                    parent = parent.find_element(By.XPATH, "..")
-                except:
-                    break
-                    
-        except Exception as e:
-            pass
-        
-        return player_data
-        
-    except Exception as e:
-        return None
-
 def parse_player_text_with_links(container):
-    """Parse player data from container text and construct player links"""
-    print("Parsing player data from text content and constructing links...")
-    
     try:
         text_content = container.text
-        print(f"DEBUG: Container text length: {len(text_content)}")
-        
         if not text_content or len(text_content) < 10:
-            print("Container text is empty or too short")
             return []
         
         lines = [line.strip() for line in text_content.split('\n') if line.strip()]
-        print(f"DEBUG: Found {len(lines)} non-empty lines")
-        
         players = []
         i = 0
         
         while i < len(lines) - 2:
-            try:
-                potential_name = lines[i]
-                potential_team = lines[i + 1] if i + 1 < len(lines) else ""
-                potential_position = lines[i + 2] if i + 2 < len(lines) else ""
-                
-                # Skip header lines or navigation
-                skip_patterns = ["name", "team", "position", "current squad", "filter", "tournaments", "teams", "positions"]
-                if any(pattern in potential_name.lower() for pattern in skip_patterns):
-                    i += 1
-                    continue
-                
-                # Check if this looks like a player entry
-                if (len(potential_name) > 1 and 
-                    len(potential_name) < 50 and
-                    not potential_name.isdigit() and
-                    ("'" in potential_name or len(potential_name.split()) >= 2)):
-                    
-                    # Construct player URL from name
-                    player_url = construct_player_url(potential_name)
-                    
-                    player_info = {
-                        "name": potential_name,
-                        "team": potential_team,
-                        "position": potential_position,
-                        "player_link": player_url,
-                        "raw_text": f"{potential_name}\n{potential_team}\n{potential_position}"
-                    }
-                    
-                    players.append(player_info)
-                    print(f"Found player: {potential_name} -> {player_url}")
-                    
-                    i += 3
-                else:
-                    i += 1
-                    
-            except Exception as e:
+            potential_name = lines[i]
+            potential_team = lines[i + 1] if i + 1 < len(lines) else ""
+            potential_position = lines[i + 2] if i + 2 < len(lines) else ""
+            
+            skip_patterns = ["name", "team", "position", "current squad", "filter", "tournaments", "teams", "positions"]
+            if any(pattern in potential_name.lower() for pattern in skip_patterns):
                 i += 1
                 continue
+            
+            if (len(potential_name) > 1 and len(potential_name) < 50 and
+                not potential_name.isdigit() and
+                ("'" in potential_name or len(potential_name.split()) >= 2)):
+                
+                player_url = construct_player_url(potential_name)
+                players.append({
+                    "name": potential_name,
+                    "team": potential_team,
+                    "position": potential_position,
+                    "player_link": player_url
+                })
+                i += 3
+            else:
+                i += 1
         
-        print(f"Parsed {len(players)} players from text with constructed URLs")
         return players
         
     except Exception as e:
@@ -349,52 +252,127 @@ def parse_player_text_with_links(container):
         return []
 
 def scrape_player_bio(driver, url):
-    """Scrape detailed player bio from bio page"""
     try:
-        print(f"Scraping bio from: {url}")
-        
         original_window = driver.current_window_handle
-        
-        # Open bio page in new tab
         driver.execute_script("window.open(arguments[0], '_blank');", url)
         time.sleep(2)
         
-        # Switch to new tab
         if len(driver.window_handles) > 1:
             driver.switch_to.window(driver.window_handles[-1])
         
-        # Wait for bio page to load
-        WebDriverWait(driver, 15).until(
-            EC.presence_of_element_located((By.TAG_NAME, "body"))
-        )
+        WebDriverWait(driver, 15).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
         time.sleep(2)
         
-        # Check if page loaded successfully
         if "404" in driver.title.lower() or "not found" in driver.title.lower():
-            print(f"Player page not found")
-            return {'extracted_details': {}}
+            return {}
         
         extracted_details = {}
         
-        # Try to find player details
+        # Strategy 1: Extract country from page source and visible text
         try:
-            # Look for player-details container
-            player_details = driver.find_element(By.CSS_SELECTOR, "div.player-details")
+            # Get the page source and visible text
+            page_source = driver.page_source.lower()
+            body_text = driver.find_element(By.TAG_NAME, "body").text
             
-            # Find all detail sections
+            # List of rugby nations to search for
+            country_names = ['england', 'wales', 'scotland', 'ireland', 'france', 'italy', 'argentina', 
+                           'australia', 'new zealand', 'south africa', 'japan', 'tonga', 'samoa', 
+                           'fiji', 'georgia', 'romania', 'uruguay', 'canada', 'usa', 'portugal', 
+                           'chile', 'brazil', 'hong kong', 'spain', 'russia', 'germany', 'belgium',
+                           'netherlands', 'poland', 'czech republic', 'ukraine', 'kenya', 'namibia',
+                           'zimbabwe', 'madagascar', 'tunisia', 'morocco', 'senegal', 'ivory coast']
+            
+            # First try to find country from visible text
+            for line in body_text.split('\n'):
+                line = line.strip()
+                if line.lower() in country_names:
+                    extracted_details['country'] = line.title()
+                    print(f"Found country from visible text: {line.title()}")
+                    break
+            
+            # If not found in visible text, try to find in page source
+            if 'country' not in extracted_details:
+                for country in country_names:
+                    # Look for country in various contexts in the HTML
+                    patterns = [
+                        f'alt="{country}"',
+                        f'title="{country}"',
+                        f'>{country}<',
+                        f'data-country="{country}"',
+                        f'country">{country}',
+                        f'team-logo.*{country}',
+                        f'{country}.*team-logo'
+                    ]
+                    
+                    for pattern in patterns:
+                        if re.search(pattern, page_source, re.IGNORECASE):
+                            extracted_details['country'] = country.title()
+                            print(f"Found country from page source: {country.title()}")
+                            break
+                    
+                    if 'country' in extracted_details:
+                        break
+            
+            # Try to find country from any element that might contain it
+            if 'country' not in extracted_details:
+                try:
+                    # Try various selectors that might contain country info
+                    selectors = [
+                        "img[alt*='flag']",
+                        "img[src*='flag']",
+                        "div.team-logo",
+                        "div.country",
+                        "span.country",
+                        "div[class*='team']",
+                        "div[class*='country']",
+                        "img[alt]",
+                        "img[title]"
+                    ]
+                    
+                    for selector in selectors:
+                        try:
+                            elements = driver.find_elements(By.CSS_SELECTOR, selector)
+                            for element in elements:
+                                # Check alt, title, and text content
+                                for attr in ['alt', 'title', 'text']:
+                                    try:
+                                        if attr == 'text':
+                                            text = element.text.strip()
+                                        else:
+                                            text = element.get_attribute(attr)
+                                        
+                                        if text and text.lower() in country_names:
+                                            extracted_details['country'] = text.title()
+                                            print(f"Found country from element {selector} {attr}: {text.title()}")
+                                            break
+                                    except:
+                                        continue
+                                
+                                if 'country' in extracted_details:
+                                    break
+                            
+                            if 'country' in extracted_details:
+                                break
+                        except:
+                            continue
+                except:
+                    pass
+                        
+        except Exception as e:
+            print(f"Could not extract country: {e}")
+        
+        # Strategy 2: Extract other details from player-details
+        try:
+            player_details = driver.find_element(By.CSS_SELECTOR, "div.player-details")
             detail_sections = player_details.find_elements(By.CSS_SELECTOR, "div.detail")
             
             for detail_section in detail_sections:
                 try:
-                    # Get the h3 heading
                     h3_element = detail_section.find_element(By.TAG_NAME, "h3")
                     heading = h3_element.text.strip().lower()
-                    
-                    # Get the content
                     content_element = detail_section.find_element(By.TAG_NAME, "p")
                     content = content_element.text.strip()
                     
-                    # Map common rugby player details
                     if 'age' in heading:
                         match = re.search(r'(\d+)', content)
                         if match:
@@ -403,68 +381,70 @@ def scrape_player_bio(driver, url):
                         extracted_details['height'] = content
                     elif 'weight' in heading:
                         extracted_details['weight'] = content
-                    elif 'nationality' in heading or 'country' in heading:
-                        extracted_details['country'] = content
                     elif 'position' in heading:
                         extracted_details['position'] = content
-                    elif 'team' in heading or 'club' in heading:
-                        extracted_details['team'] = content
-                        
-                except Exception as e:
+                    # elif 'team' in heading or 'club' in heading:
+                    #     extracted_details['team'] = content
+                except:
                     continue
-                    
         except Exception as e:
-            print(f"Error finding player details: {e}")
+            print(f"Could not extract player details: {e}")
         
-        return {'extracted_details': extracted_details}
+        # Strategy 3: Fallback text extraction
+        if not any(key in extracted_details for key in ['age', 'height', 'weight', 'position']):
+            try:
+                body_text = driver.find_element(By.TAG_NAME, "body").text.lower()
+                details_patterns = {
+                    'age': r'age[:\s]+(\d+)',
+                    'height': r'height[:\s]+([^\n]+)',
+                    'weight': r'weight[:\s]+([^\n]+)',
+                    'position': r'position[:\s]+([^\n]+)'
+                    # 'team': r'team[:\s]+([^\n]+)'
+                }
+                
+                for key, pattern in details_patterns.items():
+                    if key not in extracted_details:
+                        match = re.search(pattern, body_text)
+                        if match:
+                            extracted_details[key] = match.group(1).strip()
+            except:
+                pass
+        
+        return extracted_details
         
     except Exception as e:
         print(f"Error scraping bio: {e}")
-        return {'extracted_details': {}}
-    
+        return {}
     finally:
-        # Always try to close the bio tab and return to original window
         try:
             if len(driver.window_handles) > 1:
                 driver.close()
                 driver.switch_to.window(driver.window_handles[0])
-                time.sleep(1)
-        except Exception as e:
+        except:
             pass
 
 def scrape_all_pages():
-    """Main scraping function with pagination"""
     base_url = "https://www.rugbypass.com/players/"
     driver = setup_driver()
     all_players = []
-    page = 1
-    max_pages = 10  # Safety limit
+    max_pages = 5
 
     try:
-        # Load first page
         driver.get(base_url)
-        WebDriverWait(driver, 30).until(
-            EC.presence_of_element_located((By.TAG_NAME, "body"))
-        )
-        print(f"✓ Page loaded: {driver.title}")
-        
-        # Handle privacy popup
+        WebDriverWait(driver, 30).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
         accept_popups(driver)
         time.sleep(5)
         
-        while page <= max_pages:
+        for page in range(1, max_pages + 1):
             print(f"\n🔄 Scraping page {page}...")
             
-            # Scrape players from current page
             players = scrape_players_from_page(driver)
-            
             if not players:
                 print(f"⚠️ No players found on page {page}, stopping.")
                 break
             
             print(f"Found {len(players)} players on page {page}")
             
-            # For each player, scrape their detailed bio and save to DB
             for i, player in enumerate(players):
                 try:
                     player_name = player.get('name', 'Unknown')
@@ -472,65 +452,53 @@ def scrape_all_pages():
                     
                     if player_link:
                         print(f"Scraping bio {i+1}/{len(players)}: {player_name}")
-                        
-                        # Scrape detailed bio
                         detailed_bio = scrape_player_bio(driver, player_link)
                         player['detailed_bio'] = detailed_bio
-                        
-                        # Save to database immediately
                         insert_player(player)
-                        
                         all_players.append(player)
-                        
-                        # Small delay between bio scrapes
-                        time.sleep(1)
+                        time.sleep(2)
                     else:
                         print(f"Skipping {player_name} - no link")
-                        
                 except Exception as e:
                     print(f"Error processing player {player.get('name', 'Unknown')}: {e}")
                     continue
             
-            print(f"✅ Page {page} complete. Total players so far: {len(all_players)}")
-            
-            # Try to navigate to next page
-            try:
-                next_page_url = f"{base_url}?p={page + 1}"
-                driver.get(next_page_url)
-                time.sleep(3)
-                
-                # Check if next page has players
+            # Navigate to next page
+            if page < max_pages:
                 try:
-                    WebDriverWait(driver, 10).until(
-                        EC.presence_of_element_located((By.ID, "list-players"))
-                    )
-                    page += 1
+                    next_page_url = f"{base_url}?p={page + 1}"
+                    driver.get(next_page_url)
+                    time.sleep(3)
+                    WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.ID, "list-players")))
                 except TimeoutException:
                     print("No more pages found")
                     break
-                    
-            except Exception as e:
-                print(f"Error navigating to next page: {e}")
-                break
 
     except Exception as e:
         print(f"Error in scrape_all_pages: {e}")
-        import traceback
-        traceback.print_exc()
-    
     finally:
         driver.quit()
 
     return all_players
 
 def main():
-    print("=== Starting RugbyPass Player Scraper ===")
+    print("=== Starting Enhanced RugbyPass Player Scraper ===")
     init_db()
     print("✓ Database initialized")
     
     players = scrape_all_pages()
     print(f"\n=== Scraping Complete ===")
     print(f"Total players processed: {len(players)}")
+    
+    players_with_country = [p for p in players if p.get('detailed_bio', {}).get('country')]
+    players_with_age = [p for p in players if p.get('detailed_bio', {}).get('age')]
+    players_with_weight = [p for p in players if p.get('detailed_bio', {}).get('weight')]
+    players_with_height = [p for p in players if p.get('detailed_bio', {}).get('height')]
+    
+    print(f"Players with country: {len(players_with_country)}")
+    print(f"Players with age: {len(players_with_age)}")
+    print(f"Players with weight: {len(players_with_weight)}")
+    print(f"Players with height: {len(players_with_height)}")
 
 if __name__ == '__main__':
     main()
