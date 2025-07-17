@@ -1,5 +1,7 @@
 import os
+import json
 import time
+import urllib.parse
 import re
 from datetime import datetime
 from dotenv import load_dotenv
@@ -11,17 +13,26 @@ from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import TimeoutException, WebDriverException, NoSuchElementException
 from webdriver_manager.chrome import ChromeDriverManager
 from apscheduler.schedulers.background import BackgroundScheduler
+
+# Importing external basketball scrapers
+from basketafrica import process_country as process_basket_africa_country, african_countries
+from basketoceania import process_country as process_basket_oceania_country, oceania_countries
+from basketeuro import process_country as process_basket_euro_country, europe_countries
+from basketasia import process_country as process_basket_asia_country, asia_countries
+from basketusa import process_country as process_basket_usa_country, us_teams
+from basketlatin import process_country as process_basket_latin_country, latin_countries
+
+# Importing the separate ultimate_rugby_scraper file
+# from ultimate_rugby_scraper import scrape_ultimate_rugby_players
+from ultimate import scrape_ultimate_rugby_players
+
+# Importing other scrapers
 from rugbypass import scrape_all_pages
-from ultimate_rugby_scraper import scrape_ultimate_rugby_players, normalize_player_data
 from athletics_scraper import scrape_all_athletics
-from basketafrica import process_country, african_countries
-from basketoceania import process_country, oceania_countries
-from basketeuro import process_country, europe_countries
-from basketasia import process_country, asia_countries
-from basketusa import process_country, us_teams
-from basketlatin import process_country, latin_countries
+
 import psycopg2
 import logging
 from typing import Optional, List, Dict, Any
@@ -35,13 +46,13 @@ logger = logging.getLogger(__name__)
 
 load_dotenv()
 
-app = FastAPI(title="Rugby Player API", version="1.0.0")
+app = FastAPI(title="Sport Player API", version="1.0.0")
 scheduler = BackgroundScheduler()
 
 # Add CORS middleware to allow frontend access
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Configure this properly for production
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -60,8 +71,9 @@ db_params = {
 scraping_status = {
     'is_running': False,
     'processed': 0,
-    'current_team': '',
-    'total_teams': 0,
+    'current_sport': '',
+    'current_item': '',
+    'total_items': 0,
     'start_time': None,
     'errors': []
 }
@@ -73,7 +85,7 @@ class Player(BaseModel):
     age: Optional[int] = None
     weight: Optional[str] = None
     height: Optional[str] = None
-    sport: str = "Rugby"
+    sport: str = "Unknown" # Changed default for API response to "Unknown" if DB value is NULL
     country: Optional[str] = None
     position: Optional[str] = None
     team: Optional[str] = None
@@ -101,8 +113,9 @@ class FilterOptions(BaseModel):
 class ScrapingStatus(BaseModel):
     is_running: bool
     processed: int
-    current_team: str
-    total_teams: int
+    current_sport: str
+    current_item: str
+    total_items: int
     start_time: Optional[datetime] = None
     errors: List[str]
 
@@ -127,11 +140,11 @@ def init_db():
                 age INTEGER,
                 weight TEXT,
                 height TEXT,
-                sport TEXT DEFAULT 'Rugby',
+                sport TEXT, -- Removed DEFAULT 'Rugby' to allow NULL
                 country TEXT,
                 position TEXT,
                 team TEXT,
-                source TEXT DEFAULT 'all.rugby',
+                source TEXT, -- Removed DEFAULT 'all.rugby'
                 player_url TEXT UNIQUE,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -140,7 +153,7 @@ def init_db():
         
         # Create logs table for error tracking
         cur.execute("""
-            CREATE TABLE IF NOT EXISTS rugby_logs (
+            CREATE TABLE IF NOT EXISTS rugby_logs ( 
                 id SERIAL PRIMARY KEY,
                 error_message TEXT,
                 player_url TEXT,
@@ -185,7 +198,7 @@ def log_error(error_message, player_url=None):
         if 'conn' in locals():
             conn.close()
 
-# Selenium setup
+# Selenium setup (for all.rugby and ultimate.rugby) - Kept as is from previous turn
 def setup_driver():
     options = Options()
     options.add_argument('--headless')
@@ -193,20 +206,40 @@ def setup_driver():
     options.add_argument('--disable-dev-shm-usage')
     options.add_argument('--disable-gpu')
     options.add_argument('--window-size=1920,1080')
-    return webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
+    options.add_argument("--disable-blink-features=AutomationControlled")
+    options.add_experimental_option("excludeSwitches", ["enable-automation"])
+    options.add_experimental_option('useAutomationExtension', False)
+    options.add_argument(
+        '--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+    )
+    options.add_argument("--log-level=3")
+    options.add_argument("--silent")
+    options.add_argument("--disable-logging")
+    
+    try:
+        service = Service(ChromeDriverManager().install())
+        service.log_path = os.devnull
+        driver = webdriver.Chrome(service=service, options=options)
+        driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+        driver.set_page_load_timeout(60)
+        driver.implicitly_wait(10)
+        logger.info("WebDriver initialized successfully")
+        return driver
+    except Exception as e:
+        logger.error(f"Error initializing WebDriver: {e}")
+        raise
 
-# Extract player info from bio section
-def extract_from_bio(driver):
+# Extract player info from bio section (for all.rugby) - Kept as is from previous turn
+def extract_from_bio_all_rugby(driver):
     try:
         container = driver.find_element(By.CSS_SELECTOR, 'div.pas')
         bio_section = container.find_element(By.CSS_SELECTOR, 'div.bio')
         bio_text = bio_section.text.strip()
 
-        # Convert height from meters to feet
         height_match = re.search(r'[Ss]tanding at ([0-9.]+) ?m', bio_text)
         if height_match:
             height_m = float(height_match.group(1))
-            total_inches = int(round(height_m * 39.3701))  # 1 meter = 39.3701 inches
+            total_inches = int(round(height_m * 39.3701)) 
             feet = total_inches // 12
             inches = total_inches % 12
             height = f"{feet}'{inches}\""
@@ -214,7 +247,7 @@ def extract_from_bio(driver):
             height = None
 
         weight_match = re.search(r'[Ww]eighing in at (\d+)', bio_text)
-        weight = weight_match.group(1) if weight_match else None
+        weight = weight_match.group(1) if weight_match else None # Store just the number
 
         team_match = re.search(r'currently plays for (.+?) in', bio_text)
         team = team_match.group(1).strip() if team_match else None
@@ -229,64 +262,25 @@ def extract_from_bio(driver):
             'country': country
         }
     except Exception as e:
-        logger.warning(f"Failed bio extraction: {e}")
+        logger.warning(f"Failed bio extraction from all.rugby: {e}")
         return {}
 
-# Insert player data into database
-def insert_player(data):
-    try:
-        conn = psycopg2.connect(**db_params)
-        cur = conn.cursor()
-        cur.execute("""
-            INSERT INTO players (name, age, weight, height, sport, country, position, team, source, player_url)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-            ON CONFLICT (player_url) DO UPDATE SET
-                age = EXCLUDED.age,
-                weight = EXCLUDED.weight,
-                height = EXCLUDED.height,
-                sport = EXCLUDED.sport,
-                country = EXCLUDED.country,
-                position = EXCLUDED.position,
-                team = EXCLUDED.team,
-                updated_at = CURRENT_TIMESTAMP;
-        """, (
-            data['name'], data['age'], data['weight'], data['height'], data.get('sport', 'Rugby'), data['country'],
-            data['position'], data['team'], data['source'], data['player_url']
-        ))
-        conn.commit()
-        logger.info(f"Saved: {data['name']}")
-        return True
-    except Exception as e:
-        logger.error(f"DB Error: {e}")
-        logger.debug(f"Failed Data: {json.dumps(data, indent=2)}")
-        log_error(f"DB Error inserting {data['name']}: {e}", data['player_url'])
-        return False
-    finally:
-        if 'cur' in locals():
-            cur.close()
-        if 'conn' in locals():
-            conn.close()
-
-# Get all team URLs from main page
-def get_all_team_urls(driver):
+# Get all team URLs from main page (for all.rugby) - Kept as is from previous turn
+def get_all_rugby_team_urls(driver):
     try:
         driver.get("https://all.rugby/players/")
         time.sleep(3)
 
-        # Scroll to bottom to ensure JS renders all
         driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
         time.sleep(3)
 
         team_urls = []
-
-        # Collect from national teams
         nation_links = driver.find_elements(By.XPATH, '//div[contains(@class, "bloc dra")]/a')
         for link in nation_links:
             href = link.get_attribute("href")
             if href:
                 team_urls.append(href)
 
-        # Collect from club and tournament teams
         club_links = driver.find_elements(By.XPATH, '//div[contains(@class, "bloc clbb")]/a')
         for link in club_links:
             href = link.get_attribute("href")
@@ -294,29 +288,29 @@ def get_all_team_urls(driver):
                 team_urls.append(href)
 
         unique_urls = list(set(team_urls))
-        logger.info(f"Found {len(unique_urls)} team URLs")
+        logger.info(f"Found {len(unique_urls)} all.rugby team URLs")
         return unique_urls
     except Exception as e:
-        logger.error(f"Failed to get team URLs: {e}")
-        log_error(f"Failed to get team URLs: {e}")
+        logger.error(f"Failed to get all.rugby team URLs: {e}")
+        log_error(f"Failed to get all.rugby team URLs: {e}")
         return []
 
-# Get player URLs from team page
-def get_player_urls_from_team(driver, team_url):
+# Get player URLs from team page (for all.rugby) - Kept as is from previous turn
+def get_player_urls_from_all_rugby_team(driver, team_url):
     try:
         driver.get(team_url)
-        time.sleep(3)
+        WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.CSS_SELECTOR, 'a[href^="/player/"]')))
         links = driver.find_elements(By.CSS_SELECTOR, 'a[href^="/player/"]')
         player_urls = [link.get_attribute("href") for link in links if '/player/' in link.get_attribute('href')]
-        logger.info(f"Found {len(player_urls)} players in team {team_url}")
+        logger.info(f"Found {len(player_urls)} players in all.rugby team {team_url}")
         return player_urls
     except Exception as e:
-        logger.error(f"Failed to fetch team players from {team_url}: {e}")
-        log_error(f"Failed to fetch team players from {team_url}: {e}")
+        logger.error(f"Failed to fetch all.rugby team players from {team_url}: {e}")
+        log_error(f"Failed to fetch all.rugby team players from {team_url}: {e}")
         return []
 
-# Scrape individual player data
-def scrape_player(driver, url):
+# Scrape individual player data (for all.rugby) - Kept as is from previous turn
+def scrape_all_rugby_player(driver, url):
     try:
         driver.get(url)
         WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.CSS_SELECTOR, 'div.pas')))
@@ -332,12 +326,13 @@ def scrape_player(driver, url):
             age = None
             position = None
 
-        bio = extract_from_bio(driver)
+        bio = extract_from_bio_all_rugby(driver) # Use specific bio extractor
         return {
             'name': name,
             'age': age,
             'weight': bio.get('weight'),
             'height': bio.get('height'),
+            'sport': 'Rugby', # Explicitly set sport for all.rugby
             'country': bio.get('country'),
             'position': position,
             'team': bio.get('team'),
@@ -345,28 +340,112 @@ def scrape_player(driver, url):
             'player_url': url
         }
     except Exception as e:
-        logger.warning(f"Failed to scrape {url}: {e}")
-        log_error(f"Failed to scrape {url}: {e}", url)
+        logger.warning(f"Failed to scrape all.rugby player {url}: {e}")
+        log_error(f"Failed to scrape all.rugby player {url}: {e}", url)
         return None
-    
-def fix_worldathletics_sport_column():
+
+# Insert player data into database
+def insert_player(data: Dict[str, Any]):
     try:
         conn = psycopg2.connect(**db_params)
         cur = conn.cursor()
+
+        # Explicitly handle sport and source to allow NULL in DB if not provided,
+        # or use a generic 'Unknown' for display.
+        # For DB insertion, pass None if no sport/source is specifically set by the scraper.
+        sport_to_insert = data.get('sport') # Will be None if key doesn't exist
+        source_to_insert = data.get('source') # Will be None if key doesn't exist
+        
         cur.execute("""
-            UPDATE players
-            SET sport = 'Athletics'
-            WHERE source = 'worldathletics.org' AND (sport IS NULL OR sport = 'Rugby');
-        """)
+            INSERT INTO players (name, age, weight, height, sport, country, position, team, source, player_url)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (player_url) DO UPDATE SET
+                name = EXCLUDED.name,
+                age = COALESCE(EXCLUDED.age, players.age),
+                weight = COALESCE(EXCLUDED.weight, players.weight),
+                height = COALESCE(EXCLUDED.height, players.height),
+                sport = EXCLUDED.sport, -- This will update to 'Basketball'/'Athletics' or 'Rugby' or NULL as provided
+                country = COALESCE(EXCLUDED.country, players.country),
+                position = COALESCE(EXCLUDED.position, players.position),
+                team = COALESCE(EXCLUDED.team, players.team),
+                source = EXCLUDED.source,
+                updated_at = CURRENT_TIMESTAMP;
+        """, (
+            data['name'], data.get('age'), data.get('weight'), data.get('height'),
+            sport_to_insert, data.get('country'), data.get('position'), data.get('team'),
+            source_to_insert, data['player_url']
+        ))
         conn.commit()
-        logger.info("✔️ Fixed sport column for worldathletics.org entries.")
+        logger.info(f"Saved: {data['name']} (Sport: {sport_to_insert}, Source: {source_to_insert})")
+        return True
     except Exception as e:
-        logger.error(f"❌ Failed to fix sport column: {e}")
+        logger.error(f"DB Error: {e}", exc_info=True)
+        logger.debug(f"Failed Data: {json.dumps(data, indent=2)}")
+        log_error(f"DB Error inserting {data.get('name', 'Unknown')}: {e}", data.get('player_url'))
+        return False
     finally:
         if 'cur' in locals():
             cur.close()
         if 'conn' in locals():
             conn.close()
+
+# --- MODIFIED Sport Fixing Function ---
+def fix_sport_columns_after_scrape():
+    try:
+        conn = psycopg2.connect(**db_params)
+        cur = conn.cursor()
+
+        # Define all known sources and their sports
+        basketball_sources = [
+            'basketball.afrobasket.com',
+            'basketball.australiabasket.com',
+            'basketball.eurobasket.com',
+            'basketball.asia-basket.com',
+            'basketball.usbasket.com',
+            'basketball.latinbasket.com'
+        ]
+        rugby_sources = [
+            'all.rugby',
+            'ultimaterugby.com',
+            'rugbypass.com' # Uncomment if you enable rugbypass scraper
+        ]
+        athletics_sources = [
+            'worldathletics.org' # Uncomment if you enable worldathletics scraper
+        ]
+
+        # Update Basketball sports
+        cur.execute("""
+            UPDATE players
+            SET sport = 'Basketball'
+            WHERE source IN %s AND (sport IS NULL OR sport != 'Basketball');
+        """, (tuple(basketball_sources),))
+        logger.info(f"✔️ Fixed sport column for basketball websites. Rows updated: {cur.rowcount}")
+
+        # Update Rugby sports
+        cur.execute("""
+            UPDATE players
+            SET sport = 'Rugby'
+            WHERE source IN %s AND (sport IS NULL OR sport != 'Rugby');
+        """, (tuple(rugby_sources),))
+        logger.info(f"✔️ Fixed sport column for rugby websites. Rows updated: {cur.rowcount}")
+
+        # Update Athletics sports
+        cur.execute("""
+            UPDATE players
+            SET sport = 'Athletics'
+            WHERE source IN %s AND (sport IS NULL OR sport != 'Athletics');
+        """, (tuple(athletics_sources),))
+        logger.info(f"✔️ Fixed sport column for athletics websites. Rows updated: {cur.rowcount}")
+
+        conn.commit()
+    except Exception as e:
+        logger.error(f"❌ Failed to fix sport column: {e}", exc_info=True)
+    finally:
+        if 'cur' in locals():
+            cur.close()
+        if 'conn' in locals():
+            conn.close()
+
 
 # Background scraping function
 def scrape_all_background():
@@ -374,128 +453,208 @@ def scrape_all_background():
     
     scraping_status['is_running'] = True
     scraping_status['processed'] = 0
-    scraping_status['current_team'] = ''
+    scraping_status['current_sport'] = 'Initializing...'
+    scraping_status['current_item'] = ''
+    scraping_status['total_items'] = 0
     scraping_status['start_time'] = datetime.now()
     scraping_status['errors'] = []
     
+    driver = None # Initialize driver here, to be shared by Selenium-based scrapers
     try:
-        init_db()
+        init_db() # Ensure DB is initialized
 
-        # logger.info("➡️ Running BasketLatin scraper...")
-        # for country in latin_countries:
-        #     for gender in ['men', 'women']:
-        #         process_country(country, gender, 'https://www.latinbasket.com', 'basketball.latinbasket.com', scraping_status)
-        # logger.info("✅ BasketLatin scraper completed.")
-
-        # logger.info("➡️ Running BasketUSa scraper...")
-        # for country in us_teams:
-        #     for gender in ['men', 'women']:
-        #         process_country(country, gender, 'https://www.usbasket.com', 'basketball.usbasket.com', scraping_status)
-        # logger.info("✅ BasketUsa scraper completed.")
-
-        # logger.info("➡️ Running BasketAsia scraper...")
-        # for country in asia_countries:
-        #     for gender in ['men', 'women']:
-        #         process_country(country, gender, 'https://www.asia-basket.com', 'basketball.asia-basket.com', scraping_status)
-        # logger.info("✅ BasketAsia scraper completed.")
-
-        # logger.info("➡️ Running BasketEuro scraper...")
-        # for country in europe_countries:
-        #     for gender in ['men', 'women']:
-        #         process_country(country, gender, 'https://www.eurobasket.com', 'basketball.eurobasket.com', scraping_status)
-        # logger.info("✅ BasketEuro scraper completed.")
-
-        # logger.info("➡️ Running BasketOceania scraper...")
-        # for country in oceania_countries:
-        #     for gender in ['men', 'women']:
-        #         process_country(country, gender, 'https://www.australiabasket.com', 'basketball.australiabasket.com', scraping_status)
-        # logger.info("✅ BasketOceania scraper completed.")
-
-        # logger.info("➡️ Running BasketAfrica scraper...")
-        # for country in african_countries:
-        #     for gender in ['men', 'women']:
-        #         process_country(country, gender, 'https://www.afrobasket.com', 'basketball.afrobasket.com', scraping_status)
-        # logger.info("✅ BasketAfrica scraper completed.")
-
-        # print("➡️ Running RugbyPass scraper...")
-        # scrape_all_pages()
-        # print("✅ RugbyPass scraper completed.")
-
-        # print("➡️ Running WorldAthletics scraper...")
-        # scrape_all_athletics()
-        # print("✅ WorldAthletics scraper completed.")
-
-        # players = scrape_ultimate_rugby_players()
-        # logger.info(f"Total Ultimate Rugby players scraped: {len(players)}")
-        # for player in players:
-        #     normalized = normalize_player_data(player)
-        #     if not normalized:
-        #         logger.warning(f"Skipping player with missing data: {player.get('name')}")
-        #         continue
-        #     logger.info(f"Ultimate Rugby normalized player: {player}")
-        #     result = insert_player(normalized)
-        #     if result:
-        #         logger.info(f"✅ Inserted: {normalized['name']}")
-        #     else:
-        #         logger.warning(f"❌ Failed to insert: {normalized['name']}")
-
+        # Setup Selenium driver once for all Selenium-based scrapers
         driver = setup_driver()
         
-        team_urls = get_all_team_urls(driver)
-        scraping_status['total_teams'] = len(team_urls)
-        
-        for i, team_url in enumerate(team_urls):
-            if not scraping_status['is_running']:  # Check if scraping was stopped
-                break
+        # === BasketLatin ===
+        # if scraping_status['is_running']:
+        #     scraping_status['current_sport'] = 'Basketball'
+        #     logger.info("➡️ Running BasketLatin scraper...")
+        #     # process_basket_latin_country is assumed to construct player_data correctly including 'sport': 'Basketball'
+        #     for country in latin_countries:
+        #         if not scraping_status['is_running']: break
+        #         scraping_status['current_item'] = f"{country} (Men - LatinBasket)"
+        #         process_basket_latin_country(country, 'men', 'https://www.latinbasket.com', 'basketball.latinbasket.com', scraping_status)
+        #         if not scraping_status['is_running']: break
+        #         scraping_status['current_item'] = f"{country} (Women - LatinBasket)"
+        #         process_basket_latin_country(country, 'women', 'https://www.latinbasket.com', 'basketball.latinbasket.com', scraping_status)
+        #     logger.info("✅ BasketLatin scraper completed.")
+
+        # === BasketAsia ===
+        # if scraping_status['is_running']:
+        #     scraping_status['current_sport'] = 'Basketball'
+        #     logger.info("➡️ Running BasketAsia scraper...")
+        #     for country in asia_countries:
+        #         if not scraping_status['is_running']: break
+        #         scraping_status['current_item'] = f"{country} (Men - AsiaBasket)"
+        #         process_basket_asia_country(country, 'men', 'https://www.asia-basket.com', 'basketball.asia-basket.com', scraping_status)
+        #         if not scraping_status['is_running']: break
+        #         scraping_status['current_item'] = f"{country} (Women - AsiaBasket)"
+        #         process_basket_asia_country(country, 'women', 'https://www.asia-basket.com', 'basketball.asia-basket.com', scraping_status)
+        #     logger.info("✅ BasketAsia scraper completed.")
+
+        # === BasketEuro ===
+        # if scraping_status['is_running']:
+        #     scraping_status['current_sport'] = 'Basketball'
+        #     logger.info("➡️ Running BasketEuro scraper...")
+        #     for country in europe_countries:
+        #         if not scraping_status['is_running']: break
+        #         scraping_status['current_item'] = f"{country} (Men - EuroBasket)"
+        #         process_basket_euro_country(country, 'men', 'https://www.eurobasket.com', 'basketball.eurobasket.com', scraping_status)
+        #         if not scraping_status['is_running']: break
+        #         scraping_status['current_item'] = f"{country} (Women - EuroBasket)"
+        #         process_basket_euro_country(country, 'women', 'https://www.eurobasket.com', 'basketball.eurobasket.com', scraping_status)
+        #     logger.info("✅ BasketEuro scraper completed.")
+
+        # === BasketOceania ===
+        # if scraping_status['is_running']:
+        #     scraping_status['current_sport'] = 'Basketball'
+        #     logger.info("➡️ Running BasketOceania scraper...")
+        #     for country in oceania_countries:
+        #         if not scraping_status['is_running']: break
+        #         scraping_status['current_item'] = f"{country} (Men - OceaniaBasket)"
+        #         process_basket_oceania_country(country, 'men', 'https://www.australiabasket.com', 'basketball.australiabasket.com', scraping_status)
+        #         if not scraping_status['is_running']: break
+        #         scraping_status['current_item'] = f"{country} (Women - OceaniaBasket)"
+        #         process_basket_oceania_country(country, 'women', 'https://www.australiabasket.com', 'basketball.australiabasket.com', scraping_status)
+        #     logger.info("✅ BasketOceania scraper completed.")
+
+        # === BasketAfrica ===
+        # if scraping_status['is_running']:
+        #     scraping_status['current_sport'] = 'Basketball'
+        #     logger.info("➡️ Running BasketAfrica scraper...")
+        #     for country in african_countries:
+        #         if not scraping_status['is_running']: break
+        #         scraping_status['current_item'] = f"{country} (Men - AfroBasket)"
+        #         process_basket_africa_country(country, 'men', 'https://www.afrobasket.com', 'basketball.afrobasket.com', scraping_status)
+        #         if not scraping_status['is_running']: break
+        #         scraping_status['current_item'] = f"{country} (Women - AfroBasket)"
+        #         process_basket_africa_country(country, 'women', 'https://www.afrobasket.com', 'basketball.afrobasket.com', scraping_status)
+        #     logger.info("✅ BasketAfrica scraper completed.")
+
+        # --- WorldAthletics ---
+        # if scraping_status['is_running']:
+        #     scraping_status['current_sport'] = 'Athletics'
+        #     logger.info("➡️ Running WorldAthletics scraper...")
+        #     scrape_all_athletics()
+        #     logger.info("✅ WorldAthletics scraper completed.")
+
+        # === UltimateRugby.com ===
+        # if scraping_status['is_running']:
+        #     scraping_status['current_sport'] = 'Rugby'
+        #     scraping_status['current_item'] = 'Initializing UltimateRugby Scraper...'
+        #     logger.info("➡️ Running UltimateRugby scraper...")
+            
+        #     try:
+        #         ultimate_players = scrape_ultimate_rugby_players(driver)
+        #         scraping_status['total_items'] = len(ultimate_players)
                 
-            scraping_status['current_team'] = team_url
-            logger.info(f"Processing team {i+1}/{len(team_urls)}: {team_url}")
+        #         for i, player_data in enumerate(ultimate_players):
+        #             if not scraping_status['is_running']:
+        #                 logger.info("UltimateRugby scraping stopped by user.")
+        #                 break
+
+        #             scraping_status['current_item'] = f"UltimateRugby Player {i+1}/{len(ultimate_players)}"
+        #             if insert_player(player_data):
+        #                 scraping_status['processed'] += 1
+        #             time.sleep(1)  # Rate limit
+        #     except Exception as e:
+        #         logger.error(f"❌ UltimateRugby scraping failed: {e}")
+        #         log_error(f"UltimateRugby scraping failed: {e}")
             
-            player_urls = get_player_urls_from_team(driver, team_url)
+        #     logger.info("✅ UltimateRugby scraper completed.")
+
+        # === All.Rugby (using Selenium, kept in this file) ===
+        if scraping_status['is_running']:
+            scraping_status['current_sport'] = 'Rugby'
+            scraping_status['current_item'] = 'Initializing All.Rugby Scraper...'
+            logger.info("➡️ Running All.Rugby scraper...")
             
-            for player_url in player_urls:
-                if not scraping_status['is_running']:  # Check if scraping was stopped
+            # The driver is already initialized at the start of scrape_all_background
+            team_urls = get_all_rugby_team_urls(driver) # Uses the shared driver
+            scraping_status['total_items'] = len(team_urls)
+            
+            for i, team_url in enumerate(team_urls):
+                if not scraping_status['is_running']: 
+                    logger.info("All.Rugby scraping stopped by user.")
                     break
                     
-                data = scrape_player(driver, player_url)
-                if data:
-                    if insert_player(data):
-                        scraping_status['processed'] += 1
-                        
-                time.sleep(1)  # Rate limiting
+                scraping_status['current_item'] = f"Team {i+1}/{len(team_urls)} (All.Rugby): {team_url}"
+                logger.info(f"Processing team {i+1}/{len(team_urls)} (All.Rugby): {team_url}")
                 
-            time.sleep(2)  # Rate limiting between teams
-        scraping_status['current_team'] = 'Completed'
-        
-        driver.quit()
+                player_urls = get_player_urls_from_all_rugby_team(driver, team_url) # Uses the shared driver
+                
+                for j, player_url in enumerate(player_urls):
+                    if not scraping_status['is_running']: 
+                        logger.info("All.Rugby player scraping stopped by user.")
+                        break
+                        
+                    scraping_status['current_item'] = f"Player {j+1}/{len(player_urls)} from {team_url} (All.Rugby)"
+                    data = scrape_all_rugby_player(driver, player_url) # Uses the shared driver
+                    if data:
+                        # scrape_all_rugby_player already explicitly sets 'sport': 'Rugby' and 'source': 'all.rugby'
+                        if insert_player(data): 
+                            scraping_status['processed'] += 1
+                    time.sleep(1) # Rate limiting
+                
+                time.sleep(2) # Rate limiting between teams
+            
+            logger.info("✅ All.Rugby scraper completed.")
 
-        # 🛠️ Fix incorrect sport values for worldathletics.org data
-        fix_worldathletics_sport_column()
+        # === BasketUSA ===
+        if scraping_status['is_running']:
+            scraping_status['current_sport'] = 'Basketball'
+            logger.info("➡️ Running BasketUSA scraper...")
+            for team in us_teams:
+                if not scraping_status['is_running']: break
+                scraping_status['current_item'] = f"{team} (Men - USABasket)"
+                process_basket_usa_country(team, 'men', 'https://www.usbasket.com', 'basketball.usbasket.com', scraping_status)
+                if not scraping_status['is_running']: break
+                scraping_status['current_item'] = f"{team} (Women - USABasket)"
+                process_basket_usa_country(team, 'women', 'https://www.usbasket.com', 'basketball.usbasket.com', scraping_status)
+            logger.info("✅ BasketUSA scraper completed.")
+
+        # --- RugbyPass ---
+        if scraping_status['is_running']:
+            scraping_status['current_sport'] = 'Rugby'
+            logger.info("➡️ Running RugbyPass scraper...")
+            scrape_all_pages() 
+            logger.info("✅ RugbyPass scraper completed.")
+
+
+        # --- Final sport column fixes as a safety net ---
+        fix_sport_columns_after_scrape() # Call this once after all scraping is done
         
     except Exception as e:
-        logger.error(f"Scraping error: {e}")
-        log_error(f"Scraping error: {e}")
+        logger.error(f"Global scraping error: {e}", exc_info=True)
+        log_error(f"Global scraping error: {e}")
     finally:
+        if driver:
+            driver.quit() # Ensure shared driver is closed
         scraping_status['is_running'] = False
-        scraping_status['current_team'] = 'Completed'
+        scraping_status['current_sport'] = 'Completed'
+        scraping_status['current_item'] = ''
+        scraping_status['total_items'] = 0
+
 
 # ==================== API ENDPOINTS ====================
 
 @app.on_event("startup")
 def startup_event():
-    print("✅ Server startup: Running initial scrape in background")
+    print("✅ Server startup: Running initial DB setup and starting background scheduler")
+    init_db() # Ensure DB is initialized before scheduling/scraping
     
-    # Schedule periodic scraping every 5 days (after scrape_all_background is defined)
-    scheduler.add_job(scrape_all_background, 'interval', days=5)
+    # Schedule periodic scraping every 5 days
+    scheduler.add_job(scrape_all_background, 'interval', days=5, id='full_scrape_job', max_instances=1) # max_instances to prevent overlapping runs
     scheduler.start()
     
     # Run the first scrape on startup in a separate thread
-    threading.Thread(target=scrape_all_background).start()
+    threading.Thread(target=scrape_all_background, daemon=True).start()
 
 @app.get("/", summary="API Health Check")
 async def root():
     """Health check endpoint"""
-    return {"message": "Rugby Player API is running", "version": "1.0.0"}
+    return {"message": "Sport Player API is running", "version": "1.0.0"}
 
 @app.get("/players", response_model=PlayerListResponse, summary="Get Players with Pagination, Search, and Filters")
 async def get_players(
@@ -506,9 +665,10 @@ async def get_players(
     team: Optional[str] = Query(None, description="Filter by team"),
     position: Optional[str] = Query(None, description="Filter by position"),
     source: Optional[str] = Query(None, description="Filter by source"),
+    sport: Optional[str] = Query(None, description="Filter by sport"),
     min_age: Optional[int] = Query(None, ge=0, description="Minimum age"),
     max_age: Optional[int] = Query(None, ge=0, description="Maximum age"),
-    sort_by: Optional[str] = Query("name", description="Sort by field (name, age, country, team, position)"),
+    sort_by: Optional[str] = Query("name", description="Sort by field (name, age, country, team, position, sport)"),
     sort_order: Optional[str] = Query("asc", regex="^(asc|desc)$", description="Sort order")
 ):
     """Get players with advanced filtering, searching, and pagination."""
@@ -516,7 +676,6 @@ async def get_players(
         conn = get_db_connection()
         cur = conn.cursor()
         
-        # Build the WHERE clause
         where_conditions = []
         params = []
         
@@ -539,6 +698,10 @@ async def get_players(
         if source:
             where_conditions.append("source = %s")
             params.append(source)
+
+        if sport:
+            where_conditions.append("sport = %s")
+            params.append(sport)
         
         if min_age is not None:
             where_conditions.append("age >= %s")
@@ -552,21 +715,17 @@ async def get_players(
         if where_conditions:
             where_clause = "WHERE " + " AND ".join(where_conditions)
         
-        # Validate sort_by field
-        valid_sort_fields = ["name", "age", "country", "team", "position", "id"]
+        valid_sort_fields = ["name", "age", "country", "team", "position", "id", "sport"]
         if sort_by not in valid_sort_fields:
             sort_by = "name"
         
-        # Get total count
         count_query = f"SELECT COUNT(*) FROM players {where_clause}"
         cur.execute(count_query, params)
         total_count = cur.fetchone()[0]
         
-        # Calculate pagination
         total_pages = math.ceil(total_count / per_page)
         offset = (page - 1) * per_page
         
-        # Get players with pagination
         query = f"""
             SELECT id, name, age, weight, height, sport, country, position, team, source, player_url, created_at, updated_at
             FROM players 
@@ -578,7 +737,6 @@ async def get_players(
         cur.execute(query, params + [per_page, offset])
         players_data = cur.fetchall()
         
-        # Convert to Player objects
         players = []
         for row in players_data:
             player = Player(
@@ -587,7 +745,7 @@ async def get_players(
                 age=row[2],
                 weight=row[3],
                 height=row[4],
-                sport=row[5],
+                sport=row[5] if row[5] else "Unknown", # Return "Unknown" for NULL sports
                 country=row[6],
                 position=row[7],
                 team=row[8],
@@ -611,7 +769,7 @@ async def get_players(
         return response
         
     except psycopg2.Error as e:
-        logger.error(f"Database error in get_players: {e}")
+        logger.error(f"Database error in get_players: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Database error")
     finally:
         if 'cur' in locals():
@@ -641,7 +799,7 @@ async def get_player(player_id: int):
             age=player_data[2],
             weight=player_data[3],
             height=player_data[4],
-            sport=player_data[5],
+            sport=player_data[5] if player_data[5] else "Unknown", # Return "Unknown" for NULL sports
             country=player_data[6],
             position=player_data[7],
             team=player_data[8],
@@ -654,7 +812,7 @@ async def get_player(player_id: int):
         return player
         
     except psycopg2.Error as e:
-        logger.error(f"Database error in get_player: {e}")
+        logger.error(f"Database error in get_player: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Database error")
     finally:
         if 'cur' in locals():
@@ -669,7 +827,6 @@ async def get_filter_options():
         conn = get_db_connection()
         cur = conn.cursor()
 
-        # ✅ This will now fetch sports too
         cur.execute("SELECT DISTINCT sport FROM players WHERE sport IS NOT NULL AND sport != '' ORDER BY sport")
         sports = [row[0] for row in cur.fetchall()]
 
@@ -694,7 +851,7 @@ async def get_filter_options():
         )
 
     except psycopg2.Error as e:
-        logger.error(f"Database error in get_filter_options: {e}")
+        logger.error(f"Database error in get_filter_options: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Database error")
 
     finally:
@@ -752,7 +909,7 @@ async def get_stats():
         }
         
     except psycopg2.Error as e:
-        logger.error(f"Database error in get_stats: {e}")
+        logger.error(f"Database error in get_stats: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Database error")
     finally:
         if 'cur' in locals():
@@ -815,7 +972,7 @@ async def get_logs(limit: int = Query(100, ge=1, le=1000, description="Number of
         return {"logs": logs}
         
     except psycopg2.Error as e:
-        logger.error(f"Database error in get_logs: {e}")
+        logger.error(f"Database error in get_logs: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Database error")
     finally:
         if 'cur' in locals():

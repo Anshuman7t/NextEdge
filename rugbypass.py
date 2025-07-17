@@ -135,12 +135,13 @@ def insert_player(player):
         height = cm_to_feet_inches(details.get('height'))
         
         cur.execute("""
-            INSERT INTO players (name, age, weight, height, position, country, team, source, player_url)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+            INSERT INTO players (name, age, weight, height, sport, position, country, team, source, player_url)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (player_url) DO UPDATE SET
                 age = EXCLUDED.age,
                 weight = EXCLUDED.weight,
                 height = EXCLUDED.height,
+                sport = EXCLUDED.sport,
                 position = EXCLUDED.position,
                 country = EXCLUDED.country,
                 team = EXCLUDED.team,
@@ -150,6 +151,7 @@ def insert_player(player):
             age,
             weight,
             height,
+            'Rugby',  # Default sport
             details.get('position') or player.get('position'),
             details.get('country') or 'Unknown',
             details.get('team'),

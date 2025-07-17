@@ -39,6 +39,7 @@ Pygments==2.19.2
 PySocks==1.7.1
 python-dateutil==2.9.0.post0
 python-dotenv==1.0.0
+python-multipart==0.0.20
 pywin32==310
 pyzmq==27.0.0
 requests==2.31.0
