@@ -6,12 +6,12 @@ ruby_api.db
 rugby_data
 rugbypass_player_bios
 
+ultimate_rugby_data
 
 test.ipynb
 test.py
 main.py
 proballer.py
 rugby_api.py
-ultimate.py
 ultimate_rugby_scraper.py
 main.py
